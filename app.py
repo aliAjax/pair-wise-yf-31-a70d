@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -96,8 +96,29 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS connections(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                upstream_flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
+                downstream_flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
+                passenger_count INTEGER NOT NULL DEFAULT 0,
+                min_connect_minutes INTEGER NOT NULL DEFAULT 45,
+                status TEXT NOT NULL DEFAULT 'connected',
+                computed_upstream_rev INTEGER,
+                computed_downstream_rev INTEGER,
+                computed_at TEXT,
+                UNIQUE(upstream_flight_id, downstream_flight_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_connections_upstream ON connections(upstream_flight_id);
+            CREATE INDEX IF NOT EXISTS idx_connections_downstream ON connections(downstream_flight_id);
             """
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for column, definition in (("settled_revision", "INTEGER"),):
+            cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(recovery_plans)")}
+            if column not in cols:
+                self.conn.execute(f"ALTER TABLE recovery_plans ADD COLUMN {column} {definition}")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -119,6 +140,153 @@ class AirlineRecoveryService:
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row else None
+
+    # ----- 旅客中转衔接 -----
+
+    DEFAULT_MIN_CONNECT_MINUTES = 45
+
+    def _flight_times(self, conn: sqlite3.Connection) -> dict[int, tuple[datetime, datetime]]:
+        return {row["id"]: (parse_time(row["std"]), parse_time(row["sta"]))
+                for row in conn.execute("SELECT id,std,sta FROM flights")}
+
+    def _plan_times(self, conn: sqlite3.Connection, plan_id: int) -> dict[int, tuple[datetime, datetime]]:
+        times = self._flight_times(conn)
+        for row in conn.execute("SELECT flight_id,new_std,new_sta FROM assignments WHERE plan_id=?", (plan_id,)):
+            times[row["flight_id"]] = (parse_time(row["new_std"]), parse_time(row["new_sta"]))
+        return times
+
+    def _eval_connections(self, conn: sqlite3.Connection, times: dict[int, tuple[datetime, datetime]],
+                          flight_ids: list[int] | None = None) -> list[dict[str, Any]]:
+        """按给定时刻（航班当前时刻或方案调整后的时刻）评估中转衔接。
+
+        衔接结论在读取时按最新时刻重算，保证“时刻一变结论即失效重算”。
+        旧中转记录（无计算版本）在重算前一律视为可衔接。
+        """
+        if flight_ids is None:
+            rows = conn.execute("""SELECT c.*, u.flight_no u_no, d.flight_no d_no
+                                   FROM connections c
+                                   JOIN flights u ON u.id=c.upstream_flight_id
+                                   JOIN flights d ON d.id=c.downstream_flight_id""").fetchall()
+        else:
+            if not flight_ids:
+                return []
+            placeholders = ",".join("?" * len(flight_ids))
+            rows = conn.execute(f"""SELECT c.*, u.flight_no u_no, d.flight_no d_no
+                                    FROM connections c
+                                    JOIN flights u ON u.id=c.upstream_flight_id
+                                    JOIN flights d ON d.id=c.downstream_flight_id
+                                    WHERE c.upstream_flight_id IN ({placeholders})
+                                       OR c.downstream_flight_id IN ({placeholders})""",
+                                (*flight_ids, *flight_ids)).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            upstream = times.get(item["upstream_flight_id"])
+            downstream = times.get(item["downstream_flight_id"])
+            missed = False
+            if upstream and downstream:
+                u_std, u_sta = upstream
+                d_std, _ = downstream
+                # 上游到达 + 最短衔接时间 仍晚于 下游起飞，则接不上
+                missed = (u_sta + timedelta(minutes=item["min_connect_minutes"])) > d_std
+            item["missed"] = missed
+            item["live_status"] = "missed" if missed else "connected"
+            result.append(item)
+        return result
+
+    def _recompute_stored(self, conn: sqlite3.Connection, flight_id: int) -> None:
+        """时刻变化后重算并落库该航班相关中转结论。
+
+        采用“替换”而非“追加”，重试结算不会把同一批旅客记两遍。
+        """
+        rows = conn.execute("""SELECT c.id,c.min_connect_minutes,u.sta u_sta,d.std d_std,
+                                      u.revision u_rev,d.revision d_rev
+                               FROM connections c
+                               JOIN flights u ON u.id=c.upstream_flight_id
+                               JOIN flights d ON d.id=c.downstream_flight_id
+                               WHERE c.upstream_flight_id=? OR c.downstream_flight_id=?""",
+                            (flight_id, flight_id)).fetchall()
+        for row in rows:
+            missed = (parse_time(row["u_sta"]) + timedelta(minutes=row["min_connect_minutes"])) > parse_time(row["d_std"])
+            conn.execute("""UPDATE connections SET status=?,computed_upstream_rev=?,computed_downstream_rev=?,computed_at=?
+                            WHERE id=?""",
+                         ("missed" if missed else "connected", row["u_rev"], row["d_rev"], iso(), row["id"]))
+
+    def _normalize_connections(self, conn: sqlite3.Connection, items: Any, self_flight_id: int) -> list[tuple[int, int, int]]:
+        if not isinstance(items, list):
+            raise ApiError(400, "invalid_connections", "connections 必须是列表")
+        normalized: list[tuple[int, int, int]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ApiError(400, "invalid_connection", "中转记录必须是对象")
+            downstream = item.get("downstream_flight_id")
+            count = item.get("passenger_count", 0)
+            min_connect = item.get("min_connect_minutes", self.DEFAULT_MIN_CONNECT_MINUTES)
+            if not isinstance(downstream, int) or isinstance(downstream, bool):
+                raise ApiError(400, "invalid_connection", "downstream_flight_id 必须是整数")
+            if downstream == self_flight_id:
+                raise ApiError(400, "invalid_connection", "不能衔接同一航班")
+            if not isinstance(count, int) or count < 0:
+                raise ApiError(400, "invalid_connection", "passenger_count 必须是非负整数")
+            if not isinstance(min_connect, int) or isinstance(min_connect, bool) or min_connect <= 0:
+                raise ApiError(400, "invalid_connection", "min_connect_minutes 必须是正整数")
+            if not conn.execute("SELECT 1 FROM flights WHERE id=?", (downstream,)).fetchone():
+                raise ApiError(404, "flight_not_found", f"下游航班 {downstream} 不存在")
+            normalized.append((downstream, count, min_connect))
+        return normalized
+
+    def _flight_view(self, conn: sqlite3.Connection, flight_id: int) -> dict[str, Any] | None:
+        flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            return None
+        times = self._flight_times(conn)
+        view = dict(flight)
+        view["connections"] = self._eval_connections(conn, times, [flight_id])
+        return view
+
+    def _revision_conflict(self, conn: sqlite3.Connection, entity: str, entity_id: int) -> ApiError:
+        """版本冲突时带上最新结果，让后到的调度员看到最新数据。"""
+        if entity == "flight":
+            latest = self._flight_view(conn, entity_id)
+        else:
+            latest = self.get_plan(entity_id, conn)
+        return ApiError(409, "revision_conflict", f"{entity}版本已变化", {entity: latest})
+
+    def list_missed_connections(self) -> dict[str, Any]:
+        conn = self.repo.conn
+        times = self._flight_times(conn)
+        missed = [item for item in self._eval_connections(conn, times) if item["missed"]]
+        return {"missed_connections": missed, "missed_passengers": sum(item["passenger_count"] for item in missed)}
+
+    def get_flight(self, flight_id: int) -> dict[str, Any]:
+        conn = self.repo.conn
+        view = self._flight_view(conn, flight_id)
+        if not view:
+            raise ApiError(404, "flight_not_found", "航班不存在")
+        return view
+
+    def set_flight_connections(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "connection_forbidden", "当前角色不能维护中转衔接")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int):
+            raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        with self.repo.tx() as conn:
+            flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+            if not flight:
+                raise ApiError(404, "flight_not_found", "航班不存在")
+            if flight["revision"] != expected:
+                raise self._revision_conflict(conn, "flight", flight_id)
+            connections = self._normalize_connections(conn, body.get("connections", []), flight_id)
+            # 整组替换（幂等）：重试不会把同一批旅客记两遍
+            conn.execute("DELETE FROM connections WHERE upstream_flight_id=?", (flight_id,))
+            for downstream, count, min_connect in connections:
+                conn.execute("""INSERT INTO connections(upstream_flight_id,downstream_flight_id,passenger_count,min_connect_minutes,status)
+                                VALUES(?,?,?,?,?)""", (flight_id, downstream, count, min_connect, "connected"))
+            conn.execute("UPDATE flights SET revision=revision+1,updated_at=? WHERE id=?", (iso(), flight_id))
+            self._recompute_stored(conn, flight_id)
+            Repository.audit(conn, flight_id, actor, role, "connections_updated", {"flight_id": flight_id, "count": len(connections)})
+            return self._flight_view(conn, flight_id)
 
     def seed_airport(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "ops_manager":
@@ -185,7 +353,14 @@ class AirlineRecoveryService:
                                     body["aircraft_id"], body["crew_id"], passengers, iso()))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "flight_exists", "航班号已存在") from exc
-            return dict(conn.execute("SELECT * FROM flights WHERE id=?", (cur.lastrowid,)).fetchone())
+            new_id = cur.lastrowid
+            connections = self._normalize_connections(conn, body.get("connections", []), new_id)
+            for downstream, count, min_connect in connections:
+                conn.execute("""INSERT INTO connections(upstream_flight_id,downstream_flight_id,passenger_count,min_connect_minutes,status)
+                                VALUES(?,?,?,?,?)""", (new_id, downstream, count, min_connect, "connected"))
+            if connections:
+                self._recompute_stored(conn, new_id)
+            return self._flight_view(conn, new_id)
 
     def create_disruption(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "disruption_forbidden", "当前角色不能登记中断")
@@ -310,13 +485,23 @@ class AirlineRecoveryService:
             if not problems:
                 metrics = self._metrics(conn, plan_id)
                 conn.execute("UPDATE recovery_plans SET metrics_json=?,score_json=? WHERE id=?", (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), plan_id))
-            return {"valid": not problems, "problems": problems, "plan": self.get_plan(plan_id)}
+            times = self._plan_times(conn, plan_id)
+            flight_ids = [row["flight_id"] for row in conn.execute("SELECT flight_id FROM assignments WHERE plan_id=?", (plan_id,))]
+            connections = self._eval_connections(conn, times, flight_ids) if flight_ids else []
+            missed = [item for item in connections if item["missed"]]
+            return {"valid": not problems, "problems": problems,
+                    "missed_connections": missed, "missed_passengers": sum(item["passenger_count"] for item in missed),
+                    "plan": self.get_plan(plan_id, conn)}
 
     def _metrics(self, conn: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
         rows = conn.execute("""SELECT a.*,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?""", (plan_id,)).fetchall()
         canceled = sum(1 for row in rows if row["status"] == "canceled")
+        times = self._plan_times(conn, plan_id)
+        flight_ids = [row["flight_id"] for row in rows]
+        connections = self._eval_connections(conn, times, flight_ids) if flight_ids else []
+        missed_passengers = sum(item["passenger_count"] for item in connections if item["missed"])
         return {"flight_count": len(rows), "canceled": canceled, "total_delay_minutes": sum(max(0, row["delay_minutes"]) for row in rows),
-                "affected_passengers": sum(row["passenger_count"] for row in rows), "missed_connections": sum(row["missed_connections"] for row in rows)}
+                "affected_passengers": sum(row["passenger_count"] for row in rows), "missed_connections": missed_passengers}
 
     @staticmethod
     def _score(metrics: dict[str, Any]) -> dict[str, int]:
@@ -330,8 +515,13 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
             if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
-            if plan["status"] == "locked": return self.get_plan(plan_id)
-            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
+            if plan["revision"] != expected:
+                raise self._revision_conflict(conn, "plan", plan_id)
+            if plan["status"] == "locked":
+                # 按方案版本重试：同一版本已结算过，直接返回，不重复记旅客
+                if plan["settled_revision"] == plan["revision"]:
+                    return self.get_plan(plan_id, conn)
+                return self.get_plan(plan_id, conn)
             problems = self._validate_plan(conn, plan_id)
             if problems: raise ApiError(409, "plan_invalid", "方案未通过约束校验", problems)
             conflicts = []
@@ -343,14 +533,16 @@ class AirlineRecoveryService:
                 conflicts.extend({"assignment_id": row["id"], "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]} for item in conflicting)
             if conflicts: raise ApiError(409, "locked_resource_conflict", "与已锁定方案存在飞机或机组冲突", conflicts)
             metrics = self._metrics(conn, plan_id)
-            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
-                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
+            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=?,settled_revision=? WHERE id=?""",
+                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan["revision"], plan_id))
             for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)):
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
                 conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
+                # 时刻变化后重算该航班中转结论
+                self._recompute_stored(conn, row["flight_id"])
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
-            return self.get_plan(plan_id)
+            return self.get_plan(plan_id, conn)
 
     def cancel_flight(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消航班")
@@ -359,10 +551,10 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
             if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
-            if flight["status"] == "canceled": return {"flight": dict(flight), "idempotent": True}
+            if flight["status"] == "canceled": return {"flight": self._flight_view(conn, flight_id), "idempotent": True}
             conn.execute("UPDATE flights SET status='canceled',cancel_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), flight_id))
             Repository.audit(conn, None, actor, role, "flight_canceled", {"flight_id": flight_id, "reason": reason})
-            return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()), "idempotent": False}
+            return {"flight": self._flight_view(conn, flight_id), "idempotent": False}
 
     def recover_flight(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "recover_forbidden", "当前角色不能恢复航班")
@@ -371,7 +563,8 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
             if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
-            if flight["revision"] != expected: raise ApiError(409, "revision_conflict", "航班版本已变化")
+            if flight["revision"] != expected:
+                raise self._revision_conflict(conn, "flight", flight_id)
             if flight["status"] != "canceled": raise ApiError(409, "not_canceled", "只有取消航班可以恢复")
             std, sta = parse_time(body.get("new_std")), parse_time(body.get("new_sta"))
             if sta <= std: raise ApiError(400, "invalid_times", "到达时间必须晚于起飞时间")
@@ -379,11 +572,15 @@ class AirlineRecoveryService:
             conn.execute("""UPDATE flights SET status='scheduled',std=?,sta=?,aircraft_id=?,crew_id=?,cancel_reason=NULL,
                             delay_minutes=0,revision=revision+1,updated_at=? WHERE id=?""",
                          (iso(std), iso(sta), aircraft_id, crew_id, iso(), flight_id))
+            # 时刻变化后重算中转结论
+            self._recompute_stored(conn, flight_id)
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
-            return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
+            return {"flight": self._flight_view(conn, flight_id)}
 
-    def get_plan(self, plan_id: int) -> dict[str, Any]:
-        conn = self.repo.conn
+    def get_plan(self, plan_id: int, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+        own = conn is None
+        if own:
+            conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
         if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
         assignments = [dict(r) for r in conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
@@ -391,6 +588,13 @@ class AirlineRecoveryService:
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
         result["assignments"] = assignments
+        times = self._plan_times(conn, plan_id)
+        flight_ids = [item["flight_id"] for item in assignments]
+        connections = self._eval_connections(conn, times, flight_ids) if flight_ids else []
+        missed = [item for item in connections if item["missed"]]
+        result["missed_connections"] = missed
+        result["missed_passengers"] = sum(item["passenger_count"] for item in missed)
+        result["metrics"]["missed_connections"] = sum(item["passenger_count"] for item in missed)
         return result
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
@@ -409,8 +613,12 @@ class AirlineRecoveryService:
     def state(self) -> dict[str, Any]:
         conn = self.repo.conn
         flights = [dict(r) for r in conn.execute("SELECT * FROM flights ORDER BY std")]
+        times = self._flight_times(conn)
+        connections = self._eval_connections(conn, times)
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
-        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
+        return {"flights": flights, "connections": connections,
+                "missed_passengers": sum(item["passenger_count"] for item in connections if item["missed"]),
+                "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
 
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -433,8 +641,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health": return 200, {"status": "ok", "service": "airline-recovery"}
         actor, role = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state()
+        if path == "/api/connections/missed": return 200, self.service.list_missed_connections()
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 3 and parts[:2] == ["api", "flights"] and parts[2].isdigit(): return 200, self.service.get_flight(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit() and parts[3] == "connections":
+            flight = self.service.get_flight(int(parts[2]))
+            return 200, {"flight_id": flight["id"], "connections": flight["connections"]}
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -458,6 +671,7 @@ class Handler(BaseHTTPRequestHandler):
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
             if action == "recover": return 200, self.service.recover_flight(flight_id, actor, role, body)
+            if action == "connections": return 200, self.service.set_flight_connections(flight_id, actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
